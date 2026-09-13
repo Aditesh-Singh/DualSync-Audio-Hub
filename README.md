@@ -136,10 +136,11 @@ Additional audio device support
 Improved recovery from device disconnection
 
 👨‍💻 Contributors
+## 👨‍💻 Contributors
 
-Aditesh Singh — Developer
-techmaster-cmd — Development & Testing
-
+- **Aditesh Singh** — Developer
+- **techmaster-cmd** — Development & Testing
+  
 📄 License
 
 This project is intended for educational and demonstration purposes.
