@@ -130,7 +130,7 @@ DualSync captures Windows system audio via WASAPI Loopback, routes PCM samples t
 
 ## 🚀 Usage Guide
 
-1. **Connect Devices:** Ensure both pairs of earbuds or speakers are connected and listed in Windows Sound settings.
+1. **Connect Devices:** Ensure both pairs of earbuds or speakers are connected and listed in Windows Sound settings. Open **Settings → System → Sound → Output** and select your preferred device as the **Default Output Device**.
 2. **Launch DualSync:** Open DualSync Audio Hub from the Start Menu or Desktop.
 3. **Select Endpoints:** On the **Audio** or **Devices** tab, pick Earbuds 1 (Primary) and Earbuds 2 (Secondary).
 4. **Start Streaming:** Click **Start DualSync**. System audio will now route through both endpoints.
