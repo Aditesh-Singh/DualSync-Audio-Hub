@@ -20,11 +20,9 @@ namespace DualSync.Audio
         private double currentPhaseDelayMs;
         private bool echoTestEnabled;
 
-        // Stable device IDs for reconnection
         private readonly string device1Id;
         private readonly string device2Id;
 
-        // Synchronization lock for audio output pipeline
         private readonly object outputLock = new();
 
         private bool captureStarted;
@@ -32,6 +30,10 @@ namespace DualSync.Audio
 
         private bool device1WasConnected;
         private bool device2WasConnected;
+
+        private readonly float[] telemetrySamples1 = new float[256];
+        private readonly float[] telemetrySamples2 = new float[256];
+        private readonly object telemetrySync = new();
 
         public DualAudioEngine(MMDevice device1, MMDevice device2)
         {
@@ -45,15 +47,15 @@ namespace DualSync.Audio
             capture.DataAvailable += OnAudioDataAvailable;
         }
 
-        // =========================================================
-        // REAL AUDIO PHASE DELAY & ECHO TEST
-        // =========================================================
+        public void GetWaveformTelemetry(float[] dest1, float[] dest2)
+        {
+            lock (telemetrySync)
+            {
+                Array.Copy(telemetrySamples1, dest1, Math.Min(telemetrySamples1.Length, dest1.Length));
+                Array.Copy(telemetrySamples2, dest2, Math.Min(telemetrySamples2.Length, dest2.Length));
+            }
+        }
 
-        /// <summary>
-        /// Sets real audio phase delay between Device 1 and Device 2.
-        /// Positive values delay Device 2 relative to Device 1.
-        /// Negative values delay Device 1 relative to Device 2.
-        /// </summary>
         public void SetPhaseDelay(double delayMs)
         {
             lock (outputLock)
@@ -63,10 +65,6 @@ namespace DualSync.Audio
             }
         }
 
-        /// <summary>
-        /// Enables or disables the audible Echo Stress Test.
-        /// When enabled, injects a genuine +50ms delay to Device 2 so echo is audibly verifiable.
-        /// </summary>
         public void SetEchoTest(bool enabled)
         {
             lock (outputLock)
@@ -86,7 +84,7 @@ namespace DualSync.Audio
             double effectiveDelay = currentPhaseDelayMs;
             if (echoTestEnabled)
             {
-                effectiveDelay += 50.0; // Audible echo offset
+                effectiveDelay += 50.0;
             }
 
             if (effectiveDelay >= 0.0)
@@ -100,10 +98,6 @@ namespace DualSync.Audio
                 delayBuffer2.SetDelayMs(0.0);
             }
         }
-
-        // =========================================================
-        // CONNECTION STATUS + AUTOMATIC AUDIO RECOVERY
-        // =========================================================
 
         public bool IsDevice1Connected()
         {
@@ -132,7 +126,6 @@ namespace DualSync.Audio
                     }
                     else
                     {
-                        // Dispose unused COM device handles immediately to avoid leaks
                         device.Dispose();
                     }
                 }
@@ -227,10 +220,6 @@ namespace DualSync.Audio
             }
         }
 
-        // =========================================================
-        // START / STOP
-        // =========================================================
-
         public void Start()
         {
             if (disposed)
@@ -285,12 +274,14 @@ namespace DualSync.Audio
 
                 device1WasConnected = false;
                 device2WasConnected = false;
+
+                lock (telemetrySync)
+                {
+                    Array.Clear(telemetrySamples1, 0, telemetrySamples1.Length);
+                    Array.Clear(telemetrySamples2, 0, telemetrySamples2.Length);
+                }
             }
         }
-
-        // =========================================================
-        // VOLUME & MUTE
-        // =========================================================
 
         public void SetVolume1(float volume)
         {
@@ -324,10 +315,6 @@ namespace DualSync.Audio
             }
         }
 
-        // =========================================================
-        // AUDIO DATA DISPATCH (WITH REAL TIMING DELAY)
-        // =========================================================
-
         private void OnAudioDataAvailable(object? sender, WaveInEventArgs e)
         {
             lock (outputLock)
@@ -337,23 +324,79 @@ namespace DualSync.Audio
                     return;
                 }
 
+                byte[]? d1 = null;
+                byte[]? d2 = null;
+
                 if (delayBuffer1 != null && output1 != null)
                 {
-                    byte[] data1 = delayBuffer1.Process(e.Buffer, 0, e.BytesRecorded);
-                    output1.Write(data1, 0, data1.Length);
+                    d1 = delayBuffer1.Process(e.Buffer, 0, e.BytesRecorded);
+                    output1.Write(d1, 0, d1.Length);
                 }
 
                 if (delayBuffer2 != null && output2 != null)
                 {
-                    byte[] data2 = delayBuffer2.Process(e.Buffer, 0, e.BytesRecorded);
-                    output2.Write(data2, 0, data2.Length);
+                    d2 = delayBuffer2.Process(e.Buffer, 0, e.BytesRecorded);
+                    output2.Write(d2, 0, d2.Length);
+                }
+
+                if (d1 != null && d2 != null)
+                {
+                    RecordTelemetry(d1, d2);
                 }
             }
         }
 
-        // =========================================================
-        // DISPOSE
-        // =========================================================
+        private void RecordTelemetry(byte[] d1, byte[] d2)
+        {
+            try
+            {
+                var fmt = capture.Format;
+                int bPerSample = Math.Max(1, fmt.BitsPerSample / 8);
+                int frameSize = Math.Max(1, fmt.Channels * bPerSample);
+                int frames1 = d1.Length / frameSize;
+                int frames2 = d2.Length / frameSize;
+                if (frames1 <= 0) return;
+
+                int count = 256;
+                int step1 = Math.Max(1, frames1 / count);
+                int step2 = Math.Max(1, frames2 / count);
+
+                lock (telemetrySync)
+                {
+                    for (int i = 0; i < count; i++)
+                    {
+                        int o1 = Math.Min(i * step1 * frameSize, d1.Length - bPerSample);
+                        telemetrySamples1[i] = ReadSampleFloat(d1, o1, fmt);
+                        if (frames2 > 0)
+                        {
+                            int o2 = Math.Min(i * step2 * frameSize, d2.Length - bPerSample);
+                            telemetrySamples2[i] = ReadSampleFloat(d2, o2, fmt);
+                        }
+                    }
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private static float ReadSampleFloat(byte[] data, int offset, WaveFormat fmt)
+        {
+            if (offset < 0 || offset >= data.Length) return 0f;
+            if (fmt.Encoding == WaveFormatEncoding.IeeeFloat && fmt.BitsPerSample == 32)
+            {
+                if (offset + 4 <= data.Length) return BitConverter.ToSingle(data, offset);
+            }
+            else if (fmt.BitsPerSample == 16)
+            {
+                if (offset + 2 <= data.Length)
+                {
+                    short s = (short)(data[offset] | (data[offset + 1] << 8));
+                    return s / 32768.0f;
+                }
+            }
+            return 0f;
+        }
 
         public void Dispose()
         {
@@ -388,6 +431,12 @@ namespace DualSync.Audio
 
                 device1WasConnected = false;
                 device2WasConnected = false;
+
+                lock (telemetrySync)
+                {
+                    Array.Clear(telemetrySamples1, 0, telemetrySamples1.Length);
+                    Array.Clear(telemetrySamples2, 0, telemetrySamples2.Length);
+                }
             }
         }
     }

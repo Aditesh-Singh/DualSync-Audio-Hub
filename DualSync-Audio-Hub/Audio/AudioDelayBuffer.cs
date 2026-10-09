@@ -1,129 +1,145 @@
 using System;
+using System.Collections.Generic;
 using NAudio.Wave;
 
 namespace DualSync.Audio
 {
-    /// <summary>
-    /// Implements a thread-safe, frame-aligned circular buffer that delays
-    /// incoming audio data by a specified duration in milliseconds.
-    /// This introduces real, physical audio timing delay rather than a UI mockup.
-    /// </summary>
-    public class AudioDelayBuffer
+    public sealed class AudioDelayBuffer
     {
-        private readonly WaveFormat format;
-        private readonly object bufferLock = new();
-        private readonly byte[] circularBuffer;
+        private readonly object sync = new();
+        private readonly Queue<byte> queue = new();
         private readonly int bytesPerFrame;
         private readonly int bytesPerSecond;
+        private readonly int maxDelayBytes;
 
-        private int writeIndex;
-        private int targetDelayBytes;
-        private long totalBytesWritten;
+        private int delayBytes;
 
-        public AudioDelayBuffer(WaveFormat format, double maxDelayMs = 2000.0)
+        public AudioDelayBuffer(WaveFormat format, double maxDelayMs = 2000)
         {
-            this.format = format ?? throw new ArgumentNullException(nameof(format));
+            ArgumentNullException.ThrowIfNull(format);
 
-            int bitsPerSample = format.BitsPerSample > 0 ? format.BitsPerSample : 16;
-            bytesPerFrame = format.Channels * (bitsPerSample / 8);
-            if (bytesPerFrame <= 0)
-            {
-                bytesPerFrame = 4;
-            }
+            int bytesPerSample =
+                Math.Max(1, format.BitsPerSample / 8);
 
-            bytesPerSecond = format.AverageBytesPerSecond > 0
-                ? format.AverageBytesPerSecond
-                : format.SampleRate * bytesPerFrame;
+            bytesPerFrame =
+                Math.Max(
+                    1,
+                    format.Channels * bytesPerSample);
 
-            int maxCapacity = (int)Math.Ceiling(bytesPerSecond * (maxDelayMs / 1000.0)) + (bytesPerFrame * 1024);
-            maxCapacity = (maxCapacity / bytesPerFrame) * bytesPerFrame;
-            circularBuffer = new byte[maxCapacity];
+            bytesPerSecond =
+                Math.Max(
+                    1,
+                    format.AverageBytesPerSecond);
+
+            maxDelayBytes =
+                Math.Max(
+                    bytesPerFrame,
+                    (int)(
+                        bytesPerSecond *
+                        Math.Max(0, maxDelayMs) /
+                        1000.0));
+
+            maxDelayBytes -=
+                maxDelayBytes % bytesPerFrame;
         }
 
         public void SetDelayMs(double delayMs)
         {
-            lock (bufferLock)
+            lock (sync)
             {
-                if (delayMs < 0.0)
+                delayMs = Math.Clamp(
+                    delayMs,
+                    0,
+                    2000);
+
+                int bytes =
+                    (int)Math.Round(
+                        delayMs *
+                        bytesPerSecond /
+                        1000.0);
+
+                bytes -=
+                    bytes % bytesPerFrame;
+
+                delayBytes =
+                    Math.Clamp(
+                        bytes,
+                        0,
+                        maxDelayBytes);
+
+                while (
+                    queue.Count >
+                    delayBytes + bytesPerFrame)
                 {
-                    delayMs = 0.0;
+                    for (
+                        int i = 0;
+                        i < bytesPerFrame &&
+                        queue.Count > delayBytes;
+                        i++)
+                    {
+                        queue.Dequeue();
+                    }
                 }
-
-                int desiredBytes = (int)Math.Round((delayMs / 1000.0) * bytesPerSecond);
-                desiredBytes = (desiredBytes / bytesPerFrame) * bytesPerFrame;
-
-                int maxDelay = circularBuffer.Length - bytesPerFrame;
-                targetDelayBytes = Math.Clamp(desiredBytes, 0, maxDelay);
             }
         }
 
-        public byte[] Process(byte[] input, int offset, int count)
+        public byte[] Process(
+            byte[] input,
+            int offset,
+            int count)
         {
-            lock (bufferLock)
+            if (count <= 0)
+                return Array.Empty<byte>();
+
+            lock (sync)
             {
-                if (count <= 0)
+                if (delayBytes == 0)
                 {
-                    return Array.Empty<byte>();
-                }
+                    byte[] direct =
+                        new byte[count];
 
-                if (targetDelayBytes <= 0)
-                {
-                    // Continuously populate circular buffer history so transitions are seamless
-                    for (int i = 0; i < count; i += bytesPerFrame)
-                    {
-                        int frameBytes = Math.Min(bytesPerFrame, count - i);
-                        for (int b = 0; b < frameBytes; b++)
-                        {
-                            circularBuffer[(writeIndex + b) % circularBuffer.Length] = input[offset + i + b];
-                        }
-                        writeIndex = (writeIndex + bytesPerFrame) % circularBuffer.Length;
-                        totalBytesWritten += bytesPerFrame;
-                    }
+                    Buffer.BlockCopy(
+                        input,
+                        offset,
+                        direct,
+                        0,
+                        count);
 
-                    byte[] direct = new byte[count];
-                    Buffer.BlockCopy(input, offset, direct, 0, count);
                     return direct;
                 }
 
-                byte[] output = new byte[count];
-                int outputOffset = 0;
+                int aligned =
+                    count -
+                    (count % bytesPerFrame);
 
-                for (int i = 0; i < count; i += bytesPerFrame)
+                byte[] output =
+                    new byte[count];
+
+                for (int i = 0; i < aligned; i++)
                 {
-                    int frameBytes = Math.Min(bytesPerFrame, count - i);
+                    queue.Enqueue(
+                        input[offset + i]);
+                }
 
-                    for (int b = 0; b < frameBytes; b++)
-                    {
-                        circularBuffer[(writeIndex + b) % circularBuffer.Length] = input[offset + i + b];
-                    }
+                int available =
+                    queue.Count -
+                    delayBytes;
 
-                    writeIndex = (writeIndex + bytesPerFrame) % circularBuffer.Length;
-                    totalBytesWritten += bytesPerFrame;
+                if (available <= 0)
+                    return output;
 
-                    if (totalBytesWritten < targetDelayBytes)
-                    {
-                        // Initial buffering silence until target delay window is populated
-                        for (int b = 0; b < frameBytes; b++)
-                        {
-                            output[outputOffset + b] = 0;
-                        }
-                    }
-                    else
-                    {
-                        // Calculate read index: targetDelayBytes frames prior to the frame just written
-                        int readIndex = (writeIndex - targetDelayBytes - bytesPerFrame) % circularBuffer.Length;
-                        if (readIndex < 0)
-                        {
-                            readIndex += circularBuffer.Length;
-                        }
+                int outputBytes =
+                    Math.Min(
+                        aligned,
+                        available);
 
-                        for (int b = 0; b < frameBytes; b++)
-                        {
-                            output[outputOffset + b] = circularBuffer[(readIndex + b) % circularBuffer.Length];
-                        }
-                    }
-
-                    outputOffset += frameBytes;
+                for (
+                    int i = 0;
+                    i < outputBytes;
+                    i++)
+                {
+                    output[i] =
+                        queue.Dequeue();
                 }
 
                 return output;
@@ -132,11 +148,9 @@ namespace DualSync.Audio
 
         public void Reset()
         {
-            lock (bufferLock)
+            lock (sync)
             {
-                Array.Clear(circularBuffer, 0, circularBuffer.Length);
-                writeIndex = 0;
-                totalBytesWritten = 0;
+                queue.Clear();
             }
         }
     }
